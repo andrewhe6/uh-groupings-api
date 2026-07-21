@@ -79,7 +79,7 @@ public class GroupingOwnerService {
     public GroupingGroupsMembers paginatedGrouping(String currentUser, List<String> groupPaths, Integer pageNumber,
             Integer pageSize, String sortString, Boolean isAscending) {
         log.debug(String.format(
-                "paginatedGrouping; currentUser: %s; groupPaths: %s; pageNumber: %d; pageSize: %d; sortString: %s; isAscending: %b;",
+                "paginatedGrouping; currentUser: %s; groupPaths: %s; pageNumber: %s; pageSize: %s; sortString: %s; isAscending: %b;",
                 currentUser, groupPaths, pageNumber, pageSize, sortString, isAscending));
         validatePagination(pageNumber, pageSize);
         GetMembersResults getMembersResults = grouperService.getMembersResults(
