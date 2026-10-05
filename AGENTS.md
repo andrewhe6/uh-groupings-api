@@ -17,6 +17,7 @@
     * [UH Identifier Handling](#uh-identifier-handling)
     * [Async Operations](#async-operations)
     * [Retry & Failure Handling](#retry--failure-handling)
+    * [Bulk Request Batching](#bulk-request-batching)
     * [Validation & Sanitization](#validation--sanitization)
     * [Timestamp Updates](#timestamp-updates)
   * [Service Layer Architecture](#service-layer-architecture)
@@ -156,6 +157,13 @@ protected WsSubjectLookup subjectLookup(String uhIdentifier) {
 
 This distinction must be preserved everywhere identifiers are used.
 
+A lookup can also name the subject source to search (`subjectLookup(uhIdentifier, sourceId)`). Without one, Grouper
+searches every subject source for each identifier, which takes about five times longer (15 ms vs 3 ms per identifier
+on grouper-test). Bulk validation (`SubjectService.validateUhIdentifiers`) first looks identifiers up in the source of UH
+people (`groupings.api.grouper.person-source-id`, `UH core LDAP`), then looks up the ones not found there in every
+source, and returns each valid identifier's source (`UhIdentifierValidationResult.getSubjectSourceIds()`). The adds and
+removes of `UpdateMemberService.moveGroupMembers` then look each member up in that source only.
+
 ### Async Operations
 `UpdateMemberService` uses `@Async` for long-running operations. `AsyncJobsManager` tracks in-flight jobs.
 
@@ -165,6 +173,16 @@ This distinction must be preserved everywhere identifiers are used.
 3. Controller returns job ID (202 ACCEPTED)
 4. Caller polls `/api/groupings/v2.1/jobs/{jobId}` for results
 5. `AsyncJobResult` contains status and result. If the job failed, polling rethrows the job's real exception, so it maps to its own status (e.g. 503 when Grouper is unavailable, 403 when access is denied) rather than a generic 500
+
+An async method does its work in its own body, on the async executor's thread (`AsyncConfig`), and returns
+`CompletableFuture.completedFuture(result)`. Don't hand the work to `CompletableFuture.supplyAsync()` without an
+executor: that runs it on the JVM's shared common pool, where a long import can hold up other jobs. An import holds
+its thread for the whole import, so `AsyncConfig` starts all 10 of its threads before it queues a job.
+
+**Progress:** `addIncludeMembersAsync` and `addExcludeMembersAsync` report their progress in an `AsyncJobProgress` that
+the controller creates and puts with the job (`AsyncJobsManager.putJob(job, progress)`). While the job is
+`IN_PROGRESS`, polling returns it as `progress`: the phase (`VALIDATING`, `REMOVING` or `ADDING`) and how many of the
+phase's identifiers Grouper has answered (`done` of `total`), counted per finished batch.
 
 **Async methods:**
 - `addIncludeMembersAsync()`
@@ -197,6 +215,45 @@ throw new GrouperException(...);
 - Delay: 1 second × attempt number (1s, 2s)
 - Max 2 retries (3 total attempts)
 - Throws `GrouperException` if all retries fail
+
+### Bulk Request Batching
+`GrouperApiService.getSubjects(List)`, `addMembers` and `removeMembers` send a long list through `BatchExecutor`, as
+Grouper requests of at most a batch size of identifiers each, and merge the batch results (`SubjectsResults.merge`,
+`AddMembersResults.merge`, `RemoveMembersResults.merge`), so callers get the same result as from one request.
+
+| Request | Batch size | Batches at once |
+|---|---|---|
+| Lookup (`getSubjects`) | `lookup-batch-size` (1000) | up to `max-concurrent-requests` (4) |
+| Remove (`removeMembers`) | `update-batch-size` (250) | up to `max-concurrent-requests` (4) |
+| Add (`addMembers`) | `update-batch-size` (250) | 1 |
+
+(Properties under `groupings.api.grouper.`.) Measured on grouper-test (Grouper WS 2.2.2): a lookup takes about 3 ms per
+identifier with its subject source named (see UH Identifier Handling); an add or remove about 115 ms per member;
+re-adding a listed member about 13 ms.
+
+- Why batches: Grouper answers only after processing every subject in a request, so one request for a large import
+  outlasts the Grouper client's socket timeout (`grouperClient.webService.httpSocketTimeoutMillis`, 480 s).
+- The concurrent batches of all lookups and removals share one pool of `max-concurrent-requests` threads, which caps
+  the bulk requests one API instance sends at once. 4 lookups of 1,000 take about as long as one.
+- Adds are sent one batch at a time: Grouper fails most of the members of concurrent adds to the same group with
+  `EXCEPTION` (it conflicts updating the group's `last_membership_change`). For the same reason, two adds of more than
+  one batch to the same group in one API instance wait for each other. Concurrent removes don't conflict.
+- A batch is sent again, after each of `retry-delays-millis` (5 s, 15 s), when it failed without an answer from
+  Grouper (an I/O error, or a response that isn't Grouper's) or when Grouper reports only `EXCEPTION` for its failed
+  members. Any other failure would fail again and is thrown at once. `ExecutorService`'s own retry isn't used, since it
+  treats a lookup batch in which nothing resolves as a failure.
+- Batches are not one transaction: once a batch fails, no more are started and the failure is thrown, but the batches
+  that succeeded stay applied. Re-adding a listed member (`SUCCESS_ALREADY_EXISTED`) or removing an unlisted one
+  (`SUCCESS_WASNT_IMMEDIATE`) succeeds, so a failed batch can be sent again and the whole operation repeated.
+- Each lookup batch in every source collapses its own unresolved identifiers into one `SUBJECT_NOT_FOUND` entry, so a
+  merged lookup can hold several. `SubjectService` matches results to identifiers by uid and UH number, never by
+  position or count.
+- A new `GrouperApiService` operation that takes a list as long as an import should also go through `BatchExecutor`
+  (`lookup`, `add` or `remove`), with a `merge` method on its results wrapper.
+- Moving a list longer than one update batch into include or exclude (`UpdateMemberService.moveGroupMembers`) first
+  fetches the opposite list's member ids (one request, without subject details) and removes only the identifiers
+  listed there, instead of sending every identifier for a removal that does nothing. Its `removeResults` then lists
+  only those.
 
 ### Validation & Sanitization
 Input validation happens at multiple layers:
@@ -247,6 +304,7 @@ Only called in production (not in test profiles). Tracks when groupings were las
 | `GrouperService` (interface) | Abstraction for Grouper operations                                     |
 | `GrouperApiService`          | Real Grouper integration via GrouperClient                             |
 | `ExecutorService`            | Command execution with retry logic                                     |
+| `BatchExecutor`              | Bulk lookups, adds and removes in batches, with concurrency and resends |
 | `AsyncJobsManager`           | Async job tracking and result retrieval                                |
 | `AnnouncementsService`       | System announcements                                                   |
 | `EmailService`               | Error notification emails                                              |
@@ -343,7 +401,9 @@ DELETE /api/groupings/v2.1/groupings/{path}/owners/owner-groupings/{ownerGroupin
 
 POST   /api/groupings/v2.1/groupings/group
        Body: groupPaths, pageNumber, pageSize, sortBy, isAscending
-       → GroupingGroupsMembers (paginated owned groupings)
+       → GroupingGroupsMembers (one page of the members of each group; paginationComplete once every group's
+         page is empty. Its allMembers only accounts for the members on the same page, so the UI loads all the
+         pages, 4 at a time, and works out the grouping's members and where each is listed from the whole lists)
 ```
 
 ### Opt-In/Out Operations
@@ -387,19 +447,23 @@ PUT    /api/groupings/v2.1/groupings/{path}/opt-attribute/{id}/{status}
 ```
 PUT    /api/groupings/v2.1/groupings/{path}/include-members
        Body: ["uid1", "uid2"]
-       → GroupingMoveMembersResult (add to include)
+       → GroupingMoveMembersResult (add to include; invalidUhIdentifiers lists the identifiers not added because
+         they are malformed or unknown to Grouper)
 
 PUT    /api/groupings/v2.1/groupings/{path}/include-members/async
        Body: ["uid1", "uid2"]
-       → Integer (job ID, 202 ACCEPTED)
+       → Integer (job ID, 202 ACCEPTED; the job's result is the GroupingMoveMembersResult above. The UI sends a
+         large file import here unvalidated, shows the job's progress while it polls (see Async Operations), and
+         reports invalidUhIdentifiers as not found)
 
 PUT    /api/groupings/v2.1/groupings/{path}/exclude-members
        Body: ["uid1", "uid2"]
-       → GroupingMoveMembersResult (add to exclude)
+       → GroupingMoveMembersResult (add to exclude; invalidUhIdentifiers as for include-members)
 
 PUT    /api/groupings/v2.1/groupings/{path}/exclude-members/async
        Body: ["uid1", "uid2"]
-       → Integer (job ID, 202 ACCEPTED)
+       → Integer (job ID, 202 ACCEPTED; the job's result is the GroupingMoveMembersResult above, and it reports
+         its progress like include-members/async)
 
 DELETE /api/groupings/v2.1/groupings/{path}/include-members
        Body: ["uid1", "uid2"]
@@ -467,7 +531,8 @@ POST   /api/groupings/v2.1/members/async
 ### Async Job Management
 ```
 GET    /api/groupings/v2.1/jobs/{jobId}
-       → AsyncJobResult (job status and result; a failed job returns the failure's own error status)
+       → AsyncJobResult (job status and result; a failed job returns the failure's own error status. While a job
+         that reports its progress is IN_PROGRESS, progress is {phase, done, total}; otherwise it is null)
 ```
 
 ## Type System & Enums
@@ -579,6 +644,11 @@ groupings.api.stale_subject_id         # Stale subject marker
 **Limits:**
 ```
 groupings.max.owner.limit              # Max owners per grouping (default 50)
+groupings.api.grouper.lookup-batch-size        # Max UH identifiers per bulk Grouper lookup request (default 1000)
+groupings.api.grouper.update-batch-size        # Max UH identifiers per bulk add/remove request (default 250)
+groupings.api.grouper.max-concurrent-requests  # Bulk lookup/remove requests one API instance sends at once (default 4)
+groupings.api.grouper.retry-delays-millis      # Waits before each resend of a failed bulk request (default 5000,15000)
+groupings.api.grouper.person-source-id         # Subject source of UH people, searched first (default UH core LDAP)
 ```
 
 **Grouper operations:**

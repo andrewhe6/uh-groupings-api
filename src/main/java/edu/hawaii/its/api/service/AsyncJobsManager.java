@@ -10,6 +10,7 @@ import org.apache.commons.logging.LogFactory;
 import org.springframework.stereotype.Service;
 
 import edu.hawaii.its.api.exception.AccessDeniedException;
+import edu.hawaii.its.api.type.AsyncJobProgress;
 import edu.hawaii.its.api.type.AsyncJobResult;
 
 @Service
@@ -21,14 +22,26 @@ public class AsyncJobsManager {
 
     private final ConcurrentMap<Integer, CompletableFuture<?>> jobMap;
 
+    private final ConcurrentMap<Integer, AsyncJobProgress> progressMap;
+
     public AsyncJobsManager(MemberService memberService) {
         jobMap = new ConcurrentHashMap<>();
+        progressMap = new ConcurrentHashMap<>();
         this.memberService = memberService;
     }
 
     public Integer putJob(CompletableFuture<?> job) {
         Integer jobId = job.hashCode();
         jobMap.put(jobId, job);
+        return jobId;
+    }
+
+    /**
+     * Put a job that reports its progress, which getJobResult returns while the job is in progress.
+     */
+    public Integer putJob(CompletableFuture<?> job, AsyncJobProgress progress) {
+        Integer jobId = putJob(job);
+        progressMap.put(jobId, progress);
         return jobId;
     }
 
@@ -45,10 +58,16 @@ public class AsyncJobsManager {
             return new AsyncJobResult(jobId, "NOT_FOUND");
         }
         if (!job.isDone()) {
-            return new AsyncJobResult(jobId, "IN_PROGRESS");
+            AsyncJobResult inProgress = new AsyncJobResult(jobId, "IN_PROGRESS");
+            AsyncJobProgress progress = progressMap.get(jobId);
+            if (progress != null) {
+                inProgress.setProgress(progress.snapshot());
+            }
+            return inProgress;
         }
 
         jobMap.remove(jobId);
+        progressMap.remove(jobId);
         try {
             return new AsyncJobResult(jobId, "COMPLETED", job.join());
         } catch (CompletionException e) {
