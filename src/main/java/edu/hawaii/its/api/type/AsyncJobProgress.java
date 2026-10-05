@@ -1,5 +1,8 @@
 package edu.hawaii.its.api.type;
 
+import com.fasterxml.jackson.annotation.JsonCreator;
+import com.fasterxml.jackson.annotation.JsonProperty;
+
 /**
  * How far an async job, such as a large import, has gotten: the phase it is in, and how many of that phase's UH
  * identifiers Grouper has answered for so far. The UI shows it while it polls the job. A phase's batches can finish
@@ -51,7 +54,10 @@ public class AsyncJobProgress {
         private final int done;
         private final int total;
 
-        public Snapshot(Phase phase, int done, int total) {
+        // Annotated so Jackson can read a job's progress back from its JSON, as the tests do.
+        @JsonCreator
+        public Snapshot(@JsonProperty("phase") Phase phase, @JsonProperty("done") int done,
+                @JsonProperty("total") int total) {
             this.phase = phase;
             this.done = done;
             this.total = total;
