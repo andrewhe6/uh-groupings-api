@@ -177,7 +177,9 @@ removes of `UpdateMemberService.moveGroupMembers` then look each member up in th
 An async method does its work in its own body, on the async executor's thread (`AsyncConfig`), and returns
 `CompletableFuture.completedFuture(result)`. Don't hand the work to `CompletableFuture.supplyAsync()` without an
 executor: that runs it on the JVM's shared common pool, where a long import can hold up other jobs. An import holds
-its thread for the whole import, so `AsyncConfig` starts all 10 of its threads before it queues a job.
+its thread for the whole import, so `AsyncConfig` starts all its threads (`groupings.api.async.threads`, 10) before it
+queues a job. Once they are all busy and the queue (`groupings.api.async.queue-capacity`, 100) is full, a new job is
+rejected with `TaskRejectedException`, so its request fails (500), instead of running on the request's thread.
 
 **Progress:** `addIncludeMembersAsync` and `addExcludeMembersAsync` report their progress in an `AsyncJobProgress` that
 the controller creates and puts with the job (`AsyncJobsManager.putJob(job, progress)`). While the job is
@@ -649,6 +651,8 @@ groupings.api.grouper.update-batch-size        # Max UH identifiers per bulk add
 groupings.api.grouper.max-concurrent-requests  # Bulk lookup/remove requests one API instance sends at once (default 4)
 groupings.api.grouper.retry-delays-millis      # Waits before each resend of a failed bulk request (default 5000,15000)
 groupings.api.grouper.person-source-id         # Subject source of UH people, searched first (default UH core LDAP)
+groupings.api.async.threads                    # Threads the @Async jobs run on (default 10)
+groupings.api.async.queue-capacity             # @Async jobs that wait for a thread before new ones are rejected (default 100)
 ```
 
 **Grouper operations:**
