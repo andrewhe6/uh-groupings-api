@@ -469,6 +469,79 @@ public class SubjectServiceTest {
     }
 
     @Test
+    public void validateUhIdentifiersCountsTheLookupInEverySourceInItsProgress() {
+        List<String> identifiers = List.of("00000001", "elsewhere", "nobody");
+        List<String> unresolved = List.of("elsewhere", "nobody");
+        AsyncJobProgress progress = new AsyncJobProgress();
+        List<AsyncJobProgress.Snapshot> duringSecondLookup = new ArrayList<>();
+        given(grouperService.getSubjects(eq(identifiers), eq(PERSON_SOURCE_ID), any())).willAnswer(invocation -> {
+            invocation.<IntConsumer>getArgument(2).accept(identifiers.size());
+            return subjectsResultsLikeGrouper(inSource(foundByUhNumber("00000001", "uidone"), PERSON_SOURCE_ID),
+                    notFoundEntry(), notFoundEntry());
+        });
+        given(grouperService.getSubjects(eq(unresolved), isNull(), any())).willAnswer(invocation -> {
+            duringSecondLookup.add(progress.snapshot());
+            invocation.<IntConsumer>getArgument(2).accept(unresolved.size());
+            return subjectsResultsLikeGrouper(inSource(foundByUid("00000002", "elsewhere"), "other-source"),
+                    notFoundEntry());
+        });
+
+        UhIdentifierValidationResult result = subjectService.validateUhIdentifiers(TEST_USER, identifiers, progress);
+
+        assertEquals(List.of("00000001", "00000002"), result.getValidIdentifiers());
+        assertEquals(List.of("nobody"), result.getInvalidIdentifiers());
+        // While the identifiers not found in the person source are looked up again, progress is short of its total.
+        assertEquals(1, duringSecondLookup.size());
+        assertEquals(3, duringSecondLookup.get(0).getDone());
+        assertEquals(5, duringSecondLookup.get(0).getTotal());
+        AsyncJobProgress.Snapshot snapshot = progress.snapshot();
+        assertEquals(AsyncJobProgress.Phase.VALIDATING, snapshot.getPhase());
+        assertEquals(5, snapshot.getDone());
+        assertEquals(5, snapshot.getTotal());
+    }
+
+    @Test
+    public void validateUhIdentifiersCountsTheLeftoverIdentifiersItVerifiesInItsProgress() {
+        // As in validateUhIdentifiersVerifiesLeftoverIdentifiersWhenAFoundSubjectMatchesNoneOfThem, "alias" and
+        // "unknown" are each looked up a third time, on their own.
+        List<String> identifiers = List.of("alias", "unknown", "00000001");
+        List<String> unresolved = List.of("alias", "unknown");
+        AsyncJobProgress progress = new AsyncJobProgress();
+        List<AsyncJobProgress.Snapshot> duringSingleLookups = new ArrayList<>();
+        given(grouperService.getSubjects(eq(identifiers), eq(PERSON_SOURCE_ID), any())).willAnswer(invocation -> {
+            invocation.<IntConsumer>getArgument(2).accept(identifiers.size());
+            return subjectsResultsLikeGrouper(foundByUhNumber("00000001", "uidone"),
+                    foundByUhNumber("00000009", "uidnine"), notFoundEntry());
+        });
+        given(grouperService.getSubjects(eq(unresolved), isNull(), any())).willAnswer(invocation -> {
+            invocation.<IntConsumer>getArgument(2).accept(unresolved.size());
+            return subjectsResultsLikeGrouper(foundByUhNumber("00000009", "uidnine"), notFoundEntry());
+        });
+        given(grouperService.getSubjects("alias")).willAnswer(invocation -> {
+            duringSingleLookups.add(progress.snapshot());
+            return subjectsResultsLikeGrouper(foundByUid("00000009", "alias"));
+        });
+        given(grouperService.getSubjects("unknown")).willAnswer(invocation -> {
+            duringSingleLookups.add(progress.snapshot());
+            return subjectsResultsLikeGrouper(notFoundEntry());
+        });
+
+        UhIdentifierValidationResult result = subjectService.validateUhIdentifiers(TEST_USER, identifiers, progress);
+
+        assertEquals(List.of("00000009", "00000001"), result.getValidIdentifiers());
+        assertEquals(List.of("unknown"), result.getInvalidIdentifiers());
+        // 3 looked up in the person source, then 2 in every source, then the same 2 one at a time.
+        assertEquals(2, duringSingleLookups.size());
+        assertEquals(5, duringSingleLookups.get(0).getDone());
+        assertEquals(7, duringSingleLookups.get(0).getTotal());
+        assertEquals(6, duringSingleLookups.get(1).getDone());
+        assertEquals(7, duringSingleLookups.get(1).getTotal());
+        AsyncJobProgress.Snapshot snapshot = progress.snapshot();
+        assertEquals(7, snapshot.getDone());
+        assertEquals(7, snapshot.getTotal());
+    }
+
+    @Test
     public void validateUhIdentifiersLooksInEverySourceWhenNoPersonSourceIsConfigured() {
         List<String> identifiers = List.of("00000001", "nobody");
         given(grouperService.getSubjects(eq(identifiers), isNull(), any()))

@@ -173,6 +173,7 @@ removes of `UpdateMemberService.moveGroupMembers` then look each member up in th
 3. Controller returns job ID (202 ACCEPTED)
 4. Caller polls `/api/groupings/v2.1/jobs/{jobId}` for results
 5. `AsyncJobResult` contains status and result. If the job failed, polling rethrows the job's real exception, so it maps to its own status (e.g. 503 when Grouper is unavailable, 403 when access is denied) rather than a generic 500
+6. A finished job stays readable for `groupings.api.async.finished-job-retention-millis` (10 min) after it finishes, and every poll in that time gets the same answer (the same result, or the same exception and status), so a poll sent again after its answer was lost still gets the outcome. Then `AsyncJobsManager.evictFinishedJobs` (scheduled every `job-eviction-interval-millis`, 1 min) forgets it, polled or not, and polling returns `NOT_FOUND`. A job in progress is never evicted
 
 An async method does its work in its own body, on the async executor's thread (`AsyncConfig`), and returns
 `CompletableFuture.completedFuture(result)`. Don't hand the work to `CompletableFuture.supplyAsync()` without an
@@ -184,7 +185,10 @@ rejected with `TaskRejectedException`, so its request fails (500), instead of ru
 **Progress:** `addIncludeMembersAsync` and `addExcludeMembersAsync` report their progress in an `AsyncJobProgress` that
 the controller creates and puts with the job (`AsyncJobsManager.putJob(job, progress)`). While the job is
 `IN_PROGRESS`, polling returns it as `progress`: the phase (`VALIDATING`, `REMOVING` or `ADDING`) and how many of the
-phase's identifiers Grouper has answered (`done` of `total`), counted per finished batch.
+phase's identifiers Grouper has answered (`done` of `total`), counted per finished batch. `VALIDATING` counts every
+lookup (see UH Identifier Handling): identifiers looked up again (in every source after the person source, or one at
+a time when a bulk answer can't be matched to them) are added to `total` before they are sent, so `done` never
+exceeds `total`.
 
 **Async methods:**
 - `addIncludeMembersAsync()`
@@ -534,7 +538,8 @@ POST   /api/groupings/v2.1/members/async
 ```
 GET    /api/groupings/v2.1/jobs/{jobId}
        → AsyncJobResult (job status and result; a failed job returns the failure's own error status. While a job
-         that reports its progress is IN_PROGRESS, progress is {phase, done, total}; otherwise it is null)
+         that reports its progress is IN_PROGRESS, progress is {phase, done, total}; otherwise it is null. A finished
+         job gives the same answer on every poll for 10 minutes after it finishes, then NOT_FOUND)
 ```
 
 ## Type System & Enums
@@ -653,6 +658,8 @@ groupings.api.grouper.retry-delays-millis      # Waits before each resend of a f
 groupings.api.grouper.person-source-id         # Subject source of UH people, searched first (default UH core LDAP)
 groupings.api.async.threads                    # Threads the @Async jobs run on (default 10)
 groupings.api.async.queue-capacity             # @Async jobs that wait for a thread before new ones are rejected (default 100)
+groupings.api.async.finished-job-retention-millis # How long a finished job stays readable after it finishes (default 600000)
+groupings.api.async.job-eviction-interval-millis  # How often finished jobs past their retention are evicted (default 60000)
 ```
 
 **Grouper operations:**

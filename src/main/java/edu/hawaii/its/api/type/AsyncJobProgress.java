@@ -33,6 +33,14 @@ public class AsyncJobProgress {
     }
 
     /**
+     * Count count more identifiers to be sent to Grouper in the current phase, e.g. identifiers that are looked up a
+     * second time.
+     */
+    public synchronized void addTotal(int count) {
+        total += count;
+    }
+
+    /**
      * Count count more identifiers of the current phase as answered by Grouper.
      */
     public synchronized void addDone(int count) {

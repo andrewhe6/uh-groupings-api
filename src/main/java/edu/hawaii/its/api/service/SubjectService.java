@@ -8,7 +8,6 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
-import java.util.function.IntConsumer;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 
@@ -158,25 +157,29 @@ public class SubjectService {
      * The identifiers are first looked up in the subject source of UH people (PERSON_SOURCE_ID) alone, which is
      * several times faster than in every source. The few that don't resolve there (usually unknown identifiers) are
      * looked up again in every source, so a member from another source is still found.
+     * <p>
+     * Every lookup counts towards progress. A lookup that looks identifiers up again adds them to the phase's total
+     * before it starts, so progress keeps counting up to its total, instead of standing at its total while the
+     * lookup runs.
      */
     private Map<String, Subject> resolveSubjects(List<String> uhIdentifiers, AsyncJobProgress progress) {
         if (PERSON_SOURCE_ID.isEmpty()) {
-            return resolveSubjects(uhIdentifiers, null, progress::addDone, true);
+            return resolveSubjects(uhIdentifiers, null, progress, true);
         }
-        Map<String, Subject> resolved = resolveSubjects(uhIdentifiers, PERSON_SOURCE_ID, progress::addDone, false);
+        Map<String, Subject> resolved = resolveSubjects(uhIdentifiers, PERSON_SOURCE_ID, progress, false);
         List<String> unresolved = uhIdentifiers.stream()
                 .filter(uhIdentifier -> !resolved.containsKey(uhIdentifier))
                 .toList();
         if (!unresolved.isEmpty()) {
-            resolved.putAll(resolveSubjects(unresolved, null, count -> {
-            }, true));
+            progress.addTotal(unresolved.size());
+            resolved.putAll(resolveSubjects(unresolved, null, progress, true));
         }
         return resolved;
     }
 
     /**
      * Look up well-formed identifiers, in the subject source sourceId or, when it is null, in every source, and return
-     * the subject each resolved identifier belongs to.
+     * the subject each resolved identifier belongs to. Each identifier looked up counts as done in progress.
      * <p>
      * A lookup in every source does not answer with one entry per identifier: lookups that resolve to nothing are
      * collapsed into a single SUBJECT_NOT_FOUND entry, and lookups that resolve to the same subject can be too. The
@@ -184,9 +187,9 @@ public class SubjectService {
      * or count. When verifyLeftovers is set, an identifier left unmatched while a found subject matched none of the
      * identifiers is looked up again on its own.
      */
-    private Map<String, Subject> resolveSubjects(List<String> uhIdentifiers, String sourceId, IntConsumer onLookedUp,
-            boolean verifyLeftovers) {
-        SubjectsResults subjectsResults = grouperService.getSubjects(uhIdentifiers, sourceId, onLookedUp);
+    private Map<String, Subject> resolveSubjects(List<String> uhIdentifiers, String sourceId,
+            AsyncJobProgress progress, boolean verifyLeftovers) {
+        SubjectsResults subjectsResults = grouperService.getSubjects(uhIdentifiers, sourceId, progress::addDone);
         if (!subjectsResults.isSuccessful()) {
             throw new GrouperException(
                     "Grouper subject lookup failed (rawResultCode=" + subjectsResults.getRawResultCode() + ")");
@@ -217,13 +220,16 @@ public class SubjectService {
         // resolved under a form not recognised above. Verify the leftovers one at a time (a single lookup always
         // returns exactly one entry) rather than report a real member as not found.
         if (verifyLeftovers && matched.size() < found.size()) {
-            for (String uhIdentifier : uhIdentifiers) {
-                if (!resolved.containsKey(uhIdentifier)) {
-                    Subject subject = getSubject(uhIdentifier);
-                    if (isValidSubject(subject)) {
-                        resolved.put(uhIdentifier, subject);
-                    }
+            List<String> leftovers = uhIdentifiers.stream()
+                    .filter(uhIdentifier -> !resolved.containsKey(uhIdentifier))
+                    .toList();
+            progress.addTotal(leftovers.size());
+            for (String uhIdentifier : leftovers) {
+                Subject subject = getSubject(uhIdentifier);
+                if (isValidSubject(subject)) {
+                    resolved.put(uhIdentifier, subject);
                 }
+                progress.addDone(1);
             }
         }
         return resolved;
